@@ -9,22 +9,27 @@ import base64
 from io import BytesIO
 import tempfile
 import os
+import json
+import datetime
 from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage, AIMessage, SystemMessage
-import datetime
+import uuid
 import docx
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt
-
-from flask import Flask, render_template
+import bcrypt
+from flask import Flask
 from flask_wtf import FlaskForm
 from wtforms import StringField, PasswordField, SubmitField
 from wtforms.validators import DataRequired, Email
-
+from firebase_admin.exceptions import FirebaseError
 import firebase_admin
-from firebase_admin import credentials, functions
-from google.cloud import firestore
+from firebase_admin import credentials, auth, firestore, exceptions
 
+from lib.domain.User import User
+from lib.domain.InterviewContext import InterviewContext
+
+# テンプレートの定義は変更なし
 # テンプレートの定義
 templates = {
     "personal_attributes": """
@@ -104,25 +109,12 @@ def initialize_firestore(credential_path):
         firebase_admin.initialize_app(cred)
     return firestore.client()
 
-# def setup_openai_api():
-#     # Firebase Functionsの設定から直接APIキーを取得
-#     config = functions.config().openai
-#     if not config or 'apikey' not in config:
-#         raise ValueError("OpenAI API key is not set in Firebase Functions config.")
-    
-#     api_key = config['apikey']
-#     os.environ["OPENAI_API_KEY"] = api_key  # OpenAIライブラリが環境変数を使用する場合
-
-#     # OpenAIライブラリを直接使用する場合は以下のようにします
-#     openai.api_key = api_key
-
 def setup_openai_api():
     if not firebase_admin._apps:
         cred = credentials.ApplicationDefault()
         firebase_admin.initialize_app(cred, {
             'projectId': os.environ.get('GOOGLE_CLOUD_PROJECT'),
         })
-    
     # ローカル環境用の設定ファイルを読み込む
     if os.path.exists('.runtimeconfig.json'):
         with open('.runtimeconfig.json', 'r') as config_file:
@@ -131,51 +123,35 @@ def setup_openai_api():
     else:
         # 環境変数からAPIキーを取得
         api_key = os.environ.get('OPENAI_API_KEY')
-    
     if not api_key:
         raise ValueError("OpenAI API key is not set.")
-    
     # OpenAIライブラリを使用する場合
-    import openai
     openai.api_key = api_key
 
 def initialize_session_state():
-    # ログイン状態の初期化（ログインしていない状態）
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
-    # メッセージ履歴の初期化（空のリスト）
     if "messages" not in st.session_state:
         st.session_state.messages = []
-        # 現在の質問を設定（インタビューの開始メッセージ）
         st.session_state.current_question = "こんにちは！音楽サブスクサービスについてのインタビューを始めましょう。"
-        # AI応答の音声データ（HTML形式）を初期化
         st.session_state.ai_response_audio_html = ""
-        # 最後の質問表示状態を初期化（表示されていない状態）
         st.session_state.last_question_displayed = False
-        # インタビューのフェーズを初期化（個人属性フェーズから開始）
         st.session_state.phase = "personal_attributes"
-        # 会話のコンテキストを初期化（空の文字列）
         st.session_state.context = ""
-        # 質問カウントを初期化（0から開始）
         st.session_state.question_count = 0
-        # インタビューのテーマを設定
         st.session_state.theme = "音楽サブスクサービス"
-
-
-
 
 def speech_to_text(audio_bytes):
     client = OpenAI()
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
         temp_audio.write(audio_bytes)
         temp_audio_path = temp_audio.name
-    
     with open(temp_audio_path, "rb") as audio_file:
         response = client.audio.transcriptions.create(
             model="whisper-1",
             file=audio_file
         )
-        transcript = response.text
+    transcript = response.text
     return transcript
 
 def get_ai_response(messages):
@@ -195,31 +171,52 @@ def text_to_speech(text):
     audio_base64 = base64.b64encode(buffer.getvalue()).decode()
     return f'<audio autoplay="true" src="data:audio/mp3;base64,{audio_base64}"></audio>'
 
-# インタビュー結果（テーマ、サマリー、コンテキスト）をWord形式で保存
-def save_interview_results(theme, summary, context):
+def save_interview_results(theme, summary, messages):
     try:
         doc = docx.Document()
-        # タイトルを追加し、中央揃えとスタイル設定
         title = doc.add_heading(f'{theme} インタビュー結果', level=0)
         title.alignment = WD_ALIGN_PARAGRAPH.CENTER
         title_style = doc.styles['Title']
         title_style.font.size = Pt(24)
-        # サマリーの内容を段落として追加
         for i, item in enumerate(summary.split('\n')):
-            if item:  # 空行をスキップ
+            if item:
                 paragraph = doc.add_paragraph(f"{i+1}. {item}")
                 paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        # 現在時刻を取得し、ファイル名にタイムスタンプを付加
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        now = datetime.datetime.now()
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
         filename = f"{theme}_interview_results_{timestamp}.docx"
         doc.save(filename)
+        uid = firestoreUser.uid
+
+        # メッセージを辞書のリストに変換
+        contexts = [
+            f"{'ユーザー' if isinstance(msg, HumanMessage) else 'AI'}: {msg.content}"
+            for msg in messages
+        ]
+        interviewId = str(uuid.uuid4())
+        # InterviewContextインスタンスの作成
+        interview_context = InterviewContext(
+            contexts=contexts,
+            interviewId=interviewId,
+            theme=theme,
+            timestamp=timestamp
+        )
+        # Firestoreに保存
+        firestore_client.collection("users").document(uid).collection("interview_contexts").document(interviewId).set(interview_context.to_dict())
+
+        # Firestoreにユーザー情報を更新
+        user_ref = firestore_client.collection("users").document(uid)
+        user_ref.update({
+            "survey_id_list": firestore.ArrayUnion([interviewId])
+        })
+
+        
+
         return filename
     except Exception as e:
         st.error(f"インタビュー結果の保存中にエラーが発生しました: {e}")
         return None
 
-
-# フェーズ更新
 def update_phase():
     if st.session_state.question_count <= 5:
         st.session_state.phase = "personal_attributes"
@@ -234,66 +231,57 @@ def update_phase():
 
 def process_user_input(audio):
     user_input = speech_to_text(audio["bytes"])
-    # ユーザーの発言をメッセージリストに追加
     st.session_state.messages.append(HumanMessage(content=user_input))
-    # コンテキストにユーザーの発言を追加
     st.session_state.context += f"ユーザー: {user_input}\n"
     st.session_state.question_count += 1
 
 def generate_ai_response():
-    # サマリーフェーズでない場合の処理
     if st.session_state.phase != "summary":
-        # システムメッセージの作成
         system_message = SystemMessage(content=templates[st.session_state.phase].format(theme=st.session_state.theme, context=st.session_state.context))
-        # メッセージリストの作成
         messages = [system_message] + st.session_state.messages
-        # AIレスポンスの生成
         ai_response = get_ai_response(messages)
-        # 生成されたレスポンスをメッセージリストとコンテキストに追加
         st.session_state.messages.append(AIMessage(content=ai_response))
         st.session_state.context += f"AI: {ai_response}\n"
-        # 現在の質問を更新
         st.session_state.current_question = ai_response
-    # サマリーフェーズの場合の処理
     else:
-        # インタビューのサマリーを生成
         summary = get_ai_response([SystemMessage(content=templates["summary"].format(theme=st.session_state.theme, context=st.session_state.context))])
-        # サマリーの表示
         st.markdown("インタビューを終了します。以下がJOBインサイトの分析結果です：")
         st.markdown(summary)
-        # インタビュー結果の保存
-        filename = save_interview_results(st.session_state.theme, summary, st.session_state.context)
+        filename = save_interview_results(st.session_state.theme, summary, st.session_state.messages)
         if filename:
             st.success(f"インタビュー結果を{filename}に保存しました。")
-        # インタビュー完了メッセージの表示
         st.markdown("インタビューが完了しました。ありがとうございました。")
         ai_response = "インタビューが完了しました。ありがとうございました。"
     return ai_response
 
-# フォーム関連
 def display_form():
     st.title("音楽サブスクサービス インタビュー対話アプリ")
-
-    # フォームの外で入力を受け付ける
-    name = st.text_input("お名前")
     age = st.number_input("年齢", min_value=0, max_value=120)
     gender = st.selectbox("性別", ["選択してください", "男性", "女性", "その他"])
     occupation = st.text_input("ご職業")
+    all_fields_filled = age > 0 and gender != "選択してください" and occupation
 
-    # 全ての項目が入力されているかチェック
-    all_fields_filled = name and age > 0 and gender != "選択してください" and occupation
-
-    # フォームの作成（送信ボタンのみ）
     with st.form("interview_form"):
         submit_button = st.form_submit_button("インタビューを開始", disabled=not all_fields_filled)
-
-    # フォーム送信時の処理
+    
     if submit_button and all_fields_filled:
         st.session_state.form_submitted = True
-        st.session_state.context += f"ユーザー情報: 名前={name}, 年齢={age}, 性別={gender}, 職業={occupation}\n"
+        st.session_state.context += f"ユーザー情報: 年齢={age}, 性別={gender}, 職業={occupation}\n"
         st.session_state.interview_started = True
 
-    # 全ての項目が入力されていない場合、メッセージを表示
+        # Firestoreにユーザー情報を更新
+        user_ref = firestore_client.collection("users").document(firestoreUser.uid)
+
+        # 年齢と性別をFirestoreに格納
+        user_ref.update({
+            "age": age,
+            "gender": gender
+        })
+
+        # セッション状態のユーザー情報も更新
+        st.session_state.user.age = age
+        st.session_state.user.gender = gender
+
     if not all_fields_filled:
         st.warning("全ての項目を入力してください。")
 
@@ -331,40 +319,70 @@ def conduct_interview():
         st.markdown(st.session_state.ai_response_audio_html, unsafe_allow_html=True)
         st.session_state.last_question_displayed = False
 
-# Firebaseの初期化
+
 def firebase_initialization(cred_path):
     if not firebase_admin._apps:
         cred = credentials.Certificate(cred_path)
-        firebase_admin.initialize_app(cred)
-
+        firebase_admin.initialize_app(cred, {
+            'databaseURL': 'https://n1-interview-default-rtdb.firebaseio.com/',
+            'projectId': 'n1-interview',
+        })
     return firestore.client()
 
-# ログインフォームの表示
 def display_login_form():
     st.title("ログイン")
     email = st.text_input("メールアドレス")
     password = st.text_input("パスワード", type="password")
     if st.button("ログイン"):
-        # ここで実際の認証処理を行う（この例では簡易的な判定）
         if email and password:
-            st.session_state.logged_in = True
-            st.success("ログインに成功しました。")
-            st.rerun()
+            success, message = login(email, password)
+            if success:
+                st.session_state.logged_in = True
+                st.session_state.user_id = firestoreUser.uid
+                st.success(message)
+                st.rerun()
+            else:
+                st.error(message)
         else:
             st.error("メールアドレスとパスワードを入力してください。")
-    
-    # サインアップボタンを追加
     st.write("アカウントをお持ちでない方は、こちらからサインアップしてください。")
     if st.button("サインアップ"):
         st.session_state.page = "signup"
         st.rerun()
 
-# サインアップフォームの表示
+def initialize_firebase():
+    global firestore_client
+    if not firebase_admin._apps:
+        cred_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
+        cred = credentials.Certificate(cred_path)
+        firebase_admin.initialize_app(cred, {
+            'databaseURL': 'https://n1-interview-default-rtdb.firebaseio.com/',
+            'projectId': 'n1-interview',
+        })
+    firestore_client = firestore.client()
+
+def getFirestoreUser(uid):
+    global firestoreUser
+    current_user_doc = firestore_client.collection("users").document(uid).get()
+    user_data = current_user_doc.to_dict()
+    firestoreUser = User.from_dict(user_data)
+
+def login(email, password):
+    try:
+        user = auth.get_user_by_email(email)
+        # パスワードの検証（実際のアプリケーションではセキュアな方法で行う必要があります）
+        custom_token = auth.create_custom_token(user.uid)
+
+        return True, "ログインに成功しました。"
+    except auth.UserNotFoundError:
+        return False, "メールアドレスまたはパスワードが間違っています。", None
+    except Exception as e:
+        return False, f"エラーが発生しました: {str(e)}", None
+
+
 def display_signup_form():
     st.title("サインアップ")
-    
-    # ユーザー情報入力フォーム
-    username = st.text_input("ユーザー名")
+    username = st.text_input("お名前")
     email = st.text_input("メールアドレス")
     password = st.text_input("パスワード", type="password")
     confirm_password = st.text_input("パスワード（確認）", type="password")
@@ -375,36 +393,44 @@ def display_signup_form():
         elif password != confirm_password:
             st.error("パスワードが一致しません。")
         else:
-            # ここでユーザー登録処理を実装
-            # 例: データベースへの保存、認証システムへの登録など
-            st.success("アカウントが作成されました。ログインしてください。")
-            st.session_state.page = "login"
-            st.rerun()
-    
-    # ログインページへの遷移ボタン
+            try:
+                # Firebase Authenticationでユーザーを作成
+                auth_user = auth.create_user(email=email, password=password)
+                # Userクラスのインスタンスを作成
+                user = User(
+                    name=username,
+                    age="",
+                    uid=auth_user.uid,
+                    occupation="",
+                    email=email,
+                    survey_id_list=[],
+                )
+                # Firestoreにユーザー情報を追加
+                firestore_client.collection("users").document(user.uid).set(user.to_dict())
+                
+                st.success("アカウントが正常に作成されました。")
+                st.session_state.page = "login"
+                st.rerun()
+            except Exception as e:
+                st.error(f"アカウント作成中にエラーが発生しました: {str(e)}")
     st.write("すでにアカウントをお持ちの方は、こちらからログインしてください。")
     if st.button("ログインページへ"):
         st.session_state.page = "login"
         st.rerun()
 
 def main():
-    # credential_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
-    # db = initialize_firestore(credential_path)
-    # db = firebase_initialization(credential_path)  # firebaseのデータベースと接続
+    initialize_firebase()  # Firebaseの初期化
     setup_openai_api()
     initialize_session_state()
 
-    # セッション状態の初期化
     if "page" not in st.session_state:
         st.session_state.page = "login"
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
 
-    # ページ表示のロジック
     if st.session_state.logged_in:
         if 'form_submitted' not in st.session_state:
             st.session_state.form_submitted = False
-
         if not st.session_state.form_submitted:
             display_form()
         elif st.session_state.interview_started:
