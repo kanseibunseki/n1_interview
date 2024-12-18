@@ -28,6 +28,7 @@ from firebase_admin import credentials, auth, firestore, exceptions
 
 from lib.domain.User import User
 from lib.domain.InterviewContext import InterviewContext
+from lib.domain.N1Interview import N1Interview
 
 # テンプレートの定義は変更なし
 # テンプレートの定義
@@ -39,6 +40,7 @@ templates = {
         質問生成の指針:
         - まず，デモグラフィック情報（年齢、職業、家族構成は必須）を聞く
         - 音楽の好みやリスニング習慣に関する質問を含める
+        - どう思っているか等の抽象的な質問は行わない
         - {theme}の利用経験について尋ねる
         - １対話で複数の質問を投げかけない
         - １対話につき質問は１つとする
@@ -56,8 +58,9 @@ templates = {
         - {theme}を利用するにあたりこんな機能があれば，みたいな要望を，具体的なエピソードなどを交えて
         - 各対話につき質問は１つに絞る
         - なぜそう思ったのかを深掘りする（それは本当に他社で満たせていないことですか？）
+        - 突然思い出して話してくれた内容を重点的に深掘る
         - このフェーズでは合計5つの質問を行う
-        - 相槌は最低限で
+        - 相槌は最低限で，感想は言わない
     """,
     "purchase_intention": """
         あなたは{theme}についてインタビューを行うインタビュアーです。
@@ -69,8 +72,9 @@ templates = {
         - 選択後の満足度や不満を具体的に聞く
         - 各対話につき質問は１つに絞る
         - なぜそう思ったのかを深掘りする（それは本当に他社で満たせていないことですか？）
-        - このフェーズでは合計5つの質問を行う
-        - 相槌は最低限で
+        - 突然思い出して話してくれた内容を重点的に深掘る
+        - このフェーズでは合計10つの質問を行う
+        - 相槌は最低限で，感想は言わない
     """,
     "competitor_analysis": """
         あなたは{theme}についてインタビューを行うインタビュアーです。
@@ -82,8 +86,9 @@ templates = {
         - 競合サービスに対する印象や期待を，具体的なエピソードなどを交えて
         - 各対話につき質問は１つに絞る
         - なぜそう思ったのかを深掘りする（それは本当に他社で満たせていないことですか？）
-        - このフェーズでは合計5つの質問を行う
-        - 相槌は最低限で
+        - 突然思い出して話してくれた内容を重点的に深掘る
+        - このフェーズでは合計10つの質問を行う
+        - 相槌は最低限で，感想は言わない
     """,
     "summary": """
         テーマ: {theme}
@@ -98,6 +103,10 @@ templates = {
     """
 }
 
+# # グローバル変数の代わりにセッション状態を使用
+# if 'interview_theme' not in st.session_state:
+#     st.session_state.theme = "あなたのインタビューテーマ"
+
 class LoginForm(FlaskForm):
     email = StringField('Email', validators=[DataRequired(), Email()])
     password = PasswordField('Password', validators=[DataRequired()])
@@ -110,36 +119,46 @@ def initialize_firestore(credential_path):
     return firestore.client()
 
 def setup_openai_api():
-    if not firebase_admin._apps:
-        cred = credentials.ApplicationDefault()
-        firebase_admin.initialize_app(cred, {
-            'projectId': os.environ.get('GOOGLE_CLOUD_PROJECT'),
-        })
-    # ローカル環境用の設定ファイルを読み込む
-    if os.path.exists('.runtimeconfig.json'):
-        with open('.runtimeconfig.json', 'r') as config_file:
-            config = json.load(config_file)
-        api_key = config.get('openai', {}).get('apikey')
-    else:
-        # 環境変数からAPIキーを取得
-        api_key = os.environ.get('OPENAI_API_KEY')
+    load_dotenv()
+    api_key = os.environ.get('OPENAI_API_KEY')
     if not api_key:
-        raise ValueError("OpenAI API key is not set.")
-    # OpenAIライブラリを使用する場合
+        raise ValueError("OpenAI API key is not set in environment variables.")
     openai.api_key = api_key
+    print("OpenAI API key has been set successfully.")
+    # print(f"OPENAI_API_KEY environment variable: {'Set' if os.environ.get('OPENAI_API_KEY') else 'Not set'}")
+    # if not firebase_admin._apps:
+    #     cred = credentials.ApplicationDefault()
+    #     firebase_admin.initialize_app(cred, {
+    #         'projectId': os.environ.get('GOOGLE_CLOUD_PROJECT'),
+    #     })
+    # # ローカル環境用の設定ファイルを読み込む
+    # if os.path.exists('.runtimeconfig.json'):
+    #     with open('.runtimeconfig.json', 'r') as config_file:
+    #         config = json.load(config_file)
+    #     api_key = config.get('openai', {}).get('apikey')
+    # else:
+    #     # 環境変数からAPIキーを取得
+    #     api_key = os.environ.get('OPENAI_API_KEY')
+    # if not api_key:
+    #     raise ValueError("OpenAI API key is not set.")
+    # # OpenAIライブラリを使用する場合
+    # openai.api_key = api_key
 
 def initialize_session_state():
-    if "logged_in" not in st.session_state:
-        st.session_state.logged_in = False
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-        st.session_state.current_question = "こんにちは！音楽サブスクサービスについてのインタビューを始めましょう。"
-        st.session_state.ai_response_audio_html = ""
-        st.session_state.last_question_displayed = False
-        st.session_state.phase = "personal_attributes"
-        st.session_state.context = ""
-        st.session_state.question_count = 0
-        st.session_state.theme = "音楽サブスクサービス"
+    if "initialized" not in st.session_state:
+        st.session_state.initialized = True
+        if "interview_theme" not in st.session_state:
+            st.session_state.theme = "あなたのインタビューテーマ"
+        if "logged_in" not in st.session_state:
+            st.session_state.logged_in = False
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+            st.session_state.current_question = f"こんにちは！{st.session_state.theme}についてのインタビューを始めましょう。"
+            st.session_state.ai_response_audio_html = ""
+            st.session_state.last_question_displayed = False
+            st.session_state.phase = "usage_situation"
+            st.session_state.context = ""
+            st.session_state.question_count = 0
 
 def speech_to_text(audio_bytes):
     client = OpenAI()
@@ -188,29 +207,52 @@ def save_interview_results(theme, summary, messages):
         doc.save(filename)
         uid = firestoreUser.uid
 
+
+
+
+
+        # ------------------------------------------------------------------------------------------------------
+        # firestoreに保存
+        # ------------------------------------------------------------------------------------------------------
         # メッセージを辞書のリストに変換
         contexts = [
             f"{'ユーザー' if isinstance(msg, HumanMessage) else 'AI'}: {msg.content}"
             for msg in messages
         ]
-        interviewId = str(uuid.uuid4())
-        # InterviewContextインスタンスの作成
-        interview_context = InterviewContext(
-            contexts=contexts,
-            interviewId=interviewId,
-            theme=theme,
-            timestamp=timestamp
-        )
-        # Firestoreに保存
-        firestore_client.collection("users").document(uid).collection("interview_contexts").document(interviewId).set(interview_context.to_dict())
+        # interview_ansId = str(uuid.uuid4())
+        # # InterviewContextインスタンスの作成
+        # interview_context = InterviewContext(
+        #     contexts=contexts,
+        #     interviewId=interview_ansId,
+        #     theme=theme,
+        #     timestamp=timestamp
+        # )
+        # # Firestoreに保存
+        # firestore_client.collection("Users").document(uid).collection("interview_contexts").document(interview_ansId).set(interview_context.to_dict())
 
-        # Firestoreにユーザー情報を更新
-        user_ref = firestore_client.collection("users").document(uid)
-        user_ref.update({
-            "survey_id_list": firestore.ArrayUnion([interviewId])
-        })
+        # # Firestoreにユーザー情報を更新
+        # user_ref = firestore_client.collection("Users").document(uid)
+        # user_ref.update({
+        #     "survey_id_list": firestore.ArrayUnion([interviewId])
+        # })
 
-        
+        # # FirestoreにN1 interview を保存
+        # interviewId = str(uuid.uuid4())
+        # doc_ref = firestore_client.collection("Interviews").document(interviewId)
+        # doc = doc_ref.get()
+        # current_participant_count = doc.to_dict().get("participant_count", 0)  
+        # n1Interview = N1Interview(
+        #     theme=theme,
+        #     purpose="",
+        #     timestamp=timestamp,
+        #     interviewId=interviewId,
+        #     participant_count=current_participant_count+1,
+        # )
+        # firestore_client.collection("Interviews").document(interviewId).set(n1Interview.to_dict())
+
+
+        # firestore_client.collection("Interviews").document(interviewId).collection("N1_interview").document(interview_ansId).set(n1Interview.to_dict())
+
 
         return filename
     except Exception as e:
@@ -220,7 +262,7 @@ def save_interview_results(theme, summary, messages):
 def update_phase():
     if st.session_state.question_count <= 5:
         st.session_state.phase = "personal_attributes"
-    elif st.session_state.question_count <= 10:
+    if st.session_state.question_count <= 10:
         st.session_state.phase = "usage_situation"
     elif st.session_state.question_count <= 15:
         st.session_state.phase = "purchase_intention"
@@ -255,7 +297,10 @@ def generate_ai_response():
     return ai_response
 
 def display_form():
-    st.title("音楽サブスクサービス インタビュー対話アプリ")
+    global firestoreUser
+    # uidの取得
+    uid = st.session_state.get('user_id')
+    st.title("インタビュー前のアンケート")
     age = st.number_input("年齢", min_value=0, max_value=120)
     gender = st.selectbox("性別", ["選択してください", "男性", "女性", "その他"])
     occupation = st.text_input("ご職業")
@@ -270,7 +315,7 @@ def display_form():
         st.session_state.interview_started = True
 
         # Firestoreにユーザー情報を更新
-        user_ref = firestore_client.collection("users").document(firestoreUser.uid)
+        user_ref = firestore_client.collection("Users").document(uid)
 
         # 年齢と性別をFirestoreに格納
         user_ref.update({
@@ -287,7 +332,7 @@ def display_form():
 
 # インタビューを実行
 def conduct_interview():
-    st.title("音楽サブスクサービス インタビュー対話アプリ")
+    st.title(st.session_state.theme)
 
     # 最後の質問が表示されていない場合、現在の質問を表示
     if not st.session_state.last_question_displayed:
@@ -335,14 +380,21 @@ def display_login_form():
     password = st.text_input("パスワード", type="password")
     if st.button("ログイン"):
         if email and password:
-            success, message = login(email, password)
-            if success:
-                st.session_state.logged_in = True
-                st.session_state.user_id = firestoreUser.uid
-                st.success(message)
-                st.rerun()
-            else:
-                st.error(message)
+            try:
+                success, message, uid = login(email, password)
+                if success:
+                    try:
+                        getFirestoreUser(uid)
+                        st.session_state.logged_in = True
+                        st.session_state.user_id = uid
+                        st.success(message)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"ユーザーデータの取得に失敗しました: {str(e)}")
+                else:
+                    st.error(message)
+            except Exception as e:
+                st.error(f"ログイン処理中にエラーが発生しました: {str(e)}")
         else:
             st.error("メールアドレスとパスワードを入力してください。")
     st.write("アカウントをお持ちでない方は、こちらからサインアップしてください。")
@@ -363,7 +415,7 @@ def initialize_firebase():
 
 def getFirestoreUser(uid):
     global firestoreUser
-    current_user_doc = firestore_client.collection("users").document(uid).get()
+    current_user_doc = firestore_client.collection("Users").document(uid).get()
     user_data = current_user_doc.to_dict()
     firestoreUser = User.from_dict(user_data)
 
@@ -372,8 +424,11 @@ def login(email, password):
         user = auth.get_user_by_email(email)
         # パスワードの検証（実際のアプリケーションではセキュアな方法で行う必要があります）
         custom_token = auth.create_custom_token(user.uid)
-
-        return True, "ログインに成功しました。"
+        
+        # userオブジェクトを作成してセッション状態に保存
+        st.session_state.user = User(uid=user.uid, email=email)
+        
+        return True, "ログインに成功しました。", user.uid
     except auth.UserNotFoundError:
         return False, "メールアドレスまたはパスワードが間違っています。", None
     except Exception as e:
@@ -406,7 +461,7 @@ def display_signup_form():
                     survey_id_list=[],
                 )
                 # Firestoreにユーザー情報を追加
-                firestore_client.collection("users").document(user.uid).set(user.to_dict())
+                firestore_client.collection("Users").document(user.uid).set(user.to_dict())
                 
                 st.success("アカウントが正常に作成されました。")
                 st.session_state.page = "login"
@@ -418,33 +473,58 @@ def display_signup_form():
         st.session_state.page = "login"
         st.rerun()
 
+# 仮のインタビューテーマ入力欄
+def display_initial_form():
+    st.title("インタビューテーマ")
+    with st.form("initial_form"):
+        interview_theme_input = st.text_input("インタビューのテーマを入力してください")
+        submit_button = st.form_submit_button("開始")
+        if submit_button:
+            if interview_theme_input:
+                st.session_state.theme = interview_theme_input
+                st.session_state.current_question = f"こんにちは！{st.session_state.theme}についてのインタビューを始めましょう。"
+                st.session_state.initial_form_submitted = True
+                st.rerun()
+            else:
+                st.error("インタビューテーマを入力してください")
+
+
 def main():
     initialize_firebase()  # Firebaseの初期化
     setup_openai_api()
     initialize_session_state()
 
-    if "page" not in st.session_state:
-        st.session_state.page = "login"
-    if "logged_in" not in st.session_state:
-        st.session_state.logged_in = False
+    if "initial_form_submitted" not in st.session_state:
+        st.session_state.initial_form_submitted = False
 
-    if st.session_state.logged_in:
-        if 'form_submitted' not in st.session_state:
-            st.session_state.form_submitted = False
-        if not st.session_state.form_submitted:
-            display_form()
-        elif st.session_state.interview_started:
-            conduct_interview()
-        else:
-            st.title("音楽サブスクサービス インタビュー対話アプリ")
-            st.write("インタビューの準備ができました。開始ボタンを押してください。")
-            if st.button("インタビューを開始"):
-                st.session_state.interview_started = True
-                st.rerun()
-    elif st.session_state.page == "login":
-        display_login_form()
-    elif st.session_state.page == "signup":
-        display_signup_form()
+    if not st.session_state.initial_form_submitted:
+        display_initial_form()
+    else:
+
+        if "page" not in st.session_state:
+            st.session_state.page = "login"
+
+        if "logged_in" not in st.session_state:
+            st.session_state.logged_in = False
+
+        if st.session_state.logged_in:
+            if 'form_submitted' not in st.session_state:
+                st.session_state.form_submitted = False
+
+            if not st.session_state.form_submitted:
+                display_form()
+            elif st.session_state.interview_started:
+                conduct_interview()
+            else:
+                st.title(st.session_state.theme)
+                st.write("インタビューの準備ができました。開始ボタンを押してください。")
+                if st.button("インタビューを開始"):
+                    st.session_state.interview_started = True
+                    st.rerun()
+        elif st.session_state.page == "login":
+            display_login_form()
+        elif st.session_state.page == "signup":
+            display_signup_form()
 
 if __name__ == "__main__":
     main()
