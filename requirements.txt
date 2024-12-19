@@ -87,7 +87,7 @@ narwhals==1.18.3
 nest-asyncio==1.6.0
 numpy==1.26.4
 oauth2client==4.1.3
-openai
+openai==1.57.4
 opentelemetry-api==1.28.2
 opentelemetry-exporter-otlp==1.28.2
 opentelemetry-exporter-otlp-proto-common==1.28.2
